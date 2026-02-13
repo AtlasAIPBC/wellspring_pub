@@ -1,0 +1,279 @@
+---
+title: "Causal Inference: Synthetic Control Estimation"
+output: html_document
+date: "2026-02-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+
+This notebook estimates causal treatment effects using an elastic-net synthetic
+control method. The workflow:
+
+1. Load treatment and control data produced by the similarity search.
+2. Reshape to wide format and split into pre/post-treatment periods.
+3. Fit elastic-net models to construct synthetic controls for each unit.
+4. Compute gaps (residuals) and RMSPE ratios for inference.
+5. Visualize the synthetic control vs. treatment unit trajectories.
+
+---
+
+## 1. Setup & Libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(glmnet)
+library(ggplot2)
+library(ggthemes)
+library(MLmetrics)
+library(tidyverse)
+library(dplyr)
+```
+
+---
+
+## 2. Load Data & Configuration
+
+```{r load-data}
+# NOTE: Update this path to point to your working directory
+setwd("/Users/phoebely/Documents/Projects/Wellspring")
+
+control_final <- read.csv("control_final_v2.csv")
+treat_final   <- read.csv("treat_final_v2.csv")
+
+# Average treatment group values by year
+# Dynamically select all numeric columns for averaging
+average_treat <- treat_final %>%
+  group_by(year) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  ungroup()
+
+```
+
+```{r config}
+# Change TREAT_YEAR
+TREAT_YEAR <- 2020            # Year treatment begins
+
+# Derive year range and counts from the data itself
+ALL_YEARS  <- sort(unique(c(control_final$year, treat_final$year)))
+YEAR_MIN   <- min(ALL_YEARS)
+YEAR_MAX   <- max(ALL_YEARS)
+N_PRE      <- sum(ALL_YEARS < TREAT_YEAR)
+N_POST     <- sum(ALL_YEARS >= TREAT_YEAR)
+```
+
+---
+
+## 3. Reshape to Wide Format
+
+Stack the control and treatment panels, then pivot so each column is a unit's
+AWI time series.
+
+```{r reshape}
+sample_TC <- rbind(control_final, treat_final)
+
+wide_TC <- sample_TC %>%
+  select(UID, year, awi) %>%
+  pivot_wider(names_from = UID, values_from = awi, names_prefix = "uid_")
+
+# Identify unit columns (everything except "year")
+unit_cols <- setdiff(names(wide_TC), "year")
+N_UNITS   <- length(unit_cols)
+
+# Split into pre- and post-treatment matrices (unit columns only)
+wide_pre_df  <- wide_TC %>% filter(year <  TREAT_YEAR)
+wide_post_df <- wide_TC %>% filter(year >= TREAT_YEAR)
+
+wide_pre  <- as.matrix(wide_pre_df[, unit_cols])
+wide_post <- as.matrix(wide_post_df[, unit_cols])
+
+cat("Pre-treatment matrix: ", dim(wide_pre),  "\n")
+cat("Post-treatment matrix:", dim(wide_post), "\n")
+```
+
+---
+
+## 4. Elastic-Net Synthetic Control Loop
+
+For each unit, fit an elastic-net regression (alpha = 0.5) on the pre-treatment
+period using all other units as donors. Weights are constrained to [0, 1] with
+no intercept.
+
+
+
+```{r elastic-net-loop, warning=FALSE}
+# Remove units with any missing values in pre or post periods
+complete_pre  <- complete.cases(t(wide_pre))
+complete_post <- complete.cases(t(wide_post))
+complete_units <- complete_pre & complete_post
+
+wide_pre  <- wide_pre[, complete_units]
+wide_post <- wide_post[, complete_units]
+unit_cols <- unit_cols[complete_units]
+N_UNITS   <- length(unit_cols)
+
+cat("Units after dropping NAs:", N_UNITS, "\n")
+
+# Pre-allocate results: one row per unit, columns = pre gaps + post gaps + 4 stats
+N_COLS     <- N_PRE + N_POST + 4  # gaps + RMSPE_post + RMSPE_pre + ratio + pct_change
+output_rmspe <- matrix(NA, nrow = N_UNITS, ncol = N_COLS)
+rownames(output_rmspe) <- unit_cols
+
+for (i in seq_along(unit_cols)) {
+
+  target_col <- unit_cols[i]
+  donor_cols <- setdiff(unit_cols, target_col)
+
+  # Fit elastic-net: predict target unit from all donor units in pre-treatment period
+  res <- glmnet(
+    x = wide_pre[, donor_cols],
+    y = wide_pre[, target_col],
+    family       = "gaussian",
+    lower.limits = 0,
+    upper.limits = 1,
+    intercept    = FALSE,
+    standardize  = FALSE,
+    alpha        = 0.5
+  )
+
+  lambda_min <- min(res$lambda)
+
+  # Predict synthetic control for pre and post periods
+  pre_pred  <- predict(res, newx = wide_pre[, donor_cols],  s = lambda_min)
+  post_pred <- predict(res, newx = wide_post[, donor_cols], s = lambda_min)
+
+  # Store pre-treatment gaps (actual - synthetic)
+  output_rmspe[i, seq_len(N_PRE)] <- wide_pre[, target_col] - pre_pred
+
+  # Store post-treatment gaps
+  output_rmspe[i, N_PRE + seq_len(N_POST)] <- wide_post[, target_col] - post_pred
+
+  # RMSPE: post, pre, ratio, and percent change
+  gap_col <- N_PRE + N_POST
+  output_rmspe[i, gap_col + 1] <- RMSPE(post_pred, wide_post[, target_col])
+  output_rmspe[i, gap_col + 2] <- RMSPE(pre_pred,  wide_pre[, target_col])
+  output_rmspe[i, gap_col + 3] <- output_rmspe[i, gap_col + 1] / output_rmspe[i, gap_col + 2]
+  output_rmspe[i, gap_col + 4] <- ((post_pred[N_POST] - post_pred[1]) / abs(post_pred[1])) * 100
+}
+```
+
+---
+
+## 5. Placebo Gap Plot
+
+Plot the gap (actual − synthetic) for every unit. The treatment unit's gap
+is highlighted in bold.
+
+```{r gap-plot, fig.width=10, fig.height=6}
+TIME_POINTS  <- ALL_YEARS
+GAP_COLS     <- seq_len(N_PRE + N_POST)
+
+treat_uid    <- paste0("uid_", unique(treat_final$UID))
+treat_row    <- which(unit_cols %in% treat_uid)
+control_rows <- setdiff(seq_along(unit_cols), treat_row)
+
+graph <- output_rmspe[control_rows, GAP_COLS]
+
+matplot(t(graph), type = "l", xlab = "Year", ylab = "Gap in AWI", xaxt = "n")
+
+# Single averaged treatment line
+treat_avg <- colMeans(output_rmspe[treat_row, GAP_COLS], na.rm = TRUE)
+matlines(treat_avg, type = "l", col = 1, lwd = 5)
+
+axis(2)
+axis(side = 1, at = seq_len(ncol(graph)), labels = TIME_POINTS)
+
+```
+
+---
+
+## 6. Build Synthetic Control vs. Treatment Comparison
+
+Extract the treatment unit's effect estimates and construct confidence bands
+using RMSPE.
+
+```{r}
+# Average across all treatment units
+gap_col    <- N_PRE + N_POST
+treat_gaps <- colMeans(output_rmspe[treat_row, , drop = FALSE], na.rm = TRUE)
+
+rmspe_post <- treat_gaps[gap_col + 1]
+rmspe_pre  <- treat_gaps[gap_col + 2]
+
+# Year-by-year effect (gap) for averaged treatment
+effect_data <- data.frame(
+  year   = ALL_YEARS,
+  effect = treat_gaps[GAP_COLS]
+)
+
+# Observed AWI for treatment group
+result_data <- average_treat %>% select(year, awi)
+
+merged_df <- effect_data %>%
+  left_join(result_data, by = "year") %>%
+  mutate(
+    RMSPE_post        = rmspe_post,
+    RMSPE_pre         = rmspe_pre,
+    synthetic_control = awi - effect,
+    RMSPE_post_upper  = awi + abs(awi) * RMSPE_post,
+    RMSPE_post_lower  = awi - abs(awi) * RMSPE_post,
+    RMSPE_pre_upper   = awi + abs(awi) * RMSPE_pre,
+    RMSPE_pre_lower   = awi - abs(awi) * RMSPE_pre
+  )
+```
+
+
+```{r summary-stats}
+outcome_col <- 'awi'
+
+summary_stats <- average_treat %>%
+  group_by(year) %>%
+  summarise(
+    mean     = signif(mean(.data[[outcome_col]]), 7),
+    p5_awi   = quantile(.data[[outcome_col]], 0.05),
+    p25_awi  = quantile(.data[[outcome_col]], 0.25),
+    p75_awi  = quantile(.data[[outcome_col]], 0.75),
+    p95_awi  = quantile(.data[[outcome_col]], 0.95)
+  )
+
+comb <- merged_df %>% left_join(summary_stats, by = "year")
+```
+
+---
+
+## 7. Final Visualization
+
+```{r synth-plot, fig.width=10, fig.height=6}
+GRAPH_TITLE <- "Synthetic Control vs. Treatment Units"
+
+ggplot(comb, aes(x = year)) +
+  # Confidence bands
+  geom_ribbon(aes(ymin = RMSPE_post_lower, ymax = RMSPE_post_upper),
+              fill = "lightgrey", alpha = 0.5) +
+  geom_ribbon(aes(ymin = RMSPE_pre_lower, ymax = RMSPE_pre_upper),
+              fill = "darkgrey", alpha = 0.5) +
+  # Treatment and synthetic control lines
+  geom_line(aes(y = mean, color = "Treatment Units"), linewidth = 1) +
+  geom_line(aes(y = synthetic_control, color = "Synthetic Control"), linewidth = 1) +
+  # Treatment year marker
+  geom_vline(xintercept = TREAT_YEAR, linetype = "dotted", color = "black") +
+  # Labels and theme
+  labs(x = "Year", y = "AWI", title = GRAPH_TITLE) +
+  scale_color_manual(
+    values = c("Synthetic Control" = "blue", "Treatment Units" = "red"),
+    name   = NULL
+  ) +
+  scale_fill_manual(
+    values = c("lightgrey", "darkgrey"),
+    labels = c("Outer CI", "Inner CI")
+  ) +
+  theme_bw() +
+  theme(
+    legend.position      = "top",
+    legend.justification = "center",
+    legend.key           = element_blank()
+  ) +
+  guides(fill = guide_legend(title = NULL))
+```
